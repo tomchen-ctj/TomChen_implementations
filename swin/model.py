@@ -89,15 +89,15 @@ class PatchEmbed(nn.Module):
         # B, C, H, W - B, 16*C, H/4, W/4
         _, _, H, W = x.shape
         # padding, if input_image%patch_size!=0, then perform padding
-        if (H % self.patch_size[0] != 0) or (W % self.patch_size[0] != 0):
-            x = F.pad(x, (0, self.patch_size[0] - W % self.patch_size[0],
+        if (H % self.patch_size[0] != 0) or (W % self.patch_size[1] != 0):
+            x = F.pad(x, (0, self.patch_size[1] - W % self.patch_size[1],
                           0, self.patch_size[0] - H % self.patch_size[0],
                           0, 0))
 
         x = self.proj(x)
         _, _, H, W = x.shape
         # B, C, H, W - B, HW, C
-        x = x.flatten(2).transpose(-1, -2)
+        x = x.flatten(2).transpose(1, 2)
         x = self.norm_layer(x)
         return x, H, W
 
@@ -117,12 +117,13 @@ class PatchMerging(nn.Module):
         x = x.view(B, H, W, C)
         # padding, until H & W % 2 == 0
         if (H % 2 != 0) or (W % 2 != 0):
-            x = F.pad(x, (0, 0, 0, 1, 0, 1))
+            x = F.pad(x, (0, 0, 0, W % 2, 0, H % 2))
         x0 = x[:, 0::2, 0::2, :]
         x1 = x[:, 1::2, 0::2, :]
         x2 = x[:, 0::2, 1::2, :]
         x3 = x[:, 1::2, 1::2, :]
         x = torch.cat([x0, x1, x2, x3], dim=-1)
+        x = x.view(B, -1, 4 * C)
 
         x = self.norm(x)
         x = self.reduction(x)
@@ -218,13 +219,14 @@ class WindowAttention(nn.Module):
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
         attn = attn + relative_position_bias.unsqueeze(0)
 
-        if mask:
+        if mask is not None:
             # mask : [nW, Mh*Mw, Mh*Mw]
             nW = mask.shape[0]
             # attn : [B, num_heads, N+1, N+1]
-            # attn.view : [B // nW, nW, num_heads,  N+1, N+1]
+            # attn.view : [B // nW, nW, num_heads, N+1, N+1]
             # mask.unsqueeze(1).unsqueeze(0) : [1, nW, 1, Mh*Mw, Mh*Mw]
             attn = attn.view(B // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
             attn = self.softmax(attn)
         else:
             attn = self.softmax(attn)
@@ -345,6 +347,7 @@ class BasicLayer(nn.Module):
         downsample: operate downsample at the end of the layer
         use_checkpoint: whether to use checkpointing to save memory
     """
+
     def __init__(self, dim, depth, num_heads, window_size,
                  mlp_ratio=4., qkv_bias=True, drop=0., attn_drop=0.,
                  drop_path=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False):
@@ -376,8 +379,8 @@ class BasicLayer(nn.Module):
 
     def create_mask(self, x, H, W):
         # create attention mask for SW-MSA
-        Hp = int(np.ceil(H / self.window_size))
-        Wp = int(np.ceil(W / self.window_size))
+        Hp = int(np.ceil(H / self.window_size)) * self.window_size
+        Wp = int(np.ceil(W / self.window_size)) * self.window_size
         img_mask = torch.zeros((1, Hp, Wp, 1), device=x.device)
 
         h_slices = (slice(0, -self.window_size),
@@ -466,8 +469,6 @@ class SwinTransformer(nn.Module):
 
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
-            # 注意这里构建的stage和论文图中有些差异
-            # 这里的stage不包含该stage的patch_merging层，包含的是下个stage的
             layers = BasicLayer(dim=int(embed_dim * 2 ** i_layer),
                                 depth=depths[i_layer],
                                 num_heads=num_heads[i_layer],
@@ -510,6 +511,7 @@ class SwinTransformer(nn.Module):
         x = torch.flatten(x, 1)
         x = self.head(x)
         return x
+
 
 def swin_tiny_patch4_window7_224(num_classes: int = 1000, **kwargs):
     # trained ImageNet-1K
@@ -621,14 +623,6 @@ def swin_large_patch4_window12_384_in22k(num_classes: int = 21841, **kwargs):
                             num_classes=num_classes,
                             **kwargs)
     return model
-
-
-
-
-
-
-
-
 
 
 if __name__ == "__main__":
